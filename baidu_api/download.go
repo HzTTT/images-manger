@@ -4,6 +4,7 @@ import (
 	"baidu_tool/utils"
 	"encoding/json"
 	"fmt"
+	"github.com/sirupsen/logrus"
 	"github.com/vbauerster/mpb"
 	"github.com/vbauerster/mpb/decor"
 	"io"
@@ -101,10 +102,10 @@ func DownloadFileOrDir(accessToken string, sources []*FileOrDir, unusedPath stri
 
 		// 如果文件太大，就下切片
 		var lastSize int64
-		var sliceNum int64
+		var sliceNum int
 		if downloadInfo.Size > MB50 {
 			// 多少个 50 MB
-			sliceNum = downloadInfo.Size / MB50
+			sliceNum = int(downloadInfo.Size / MB50)
 			// 下载完最后的碎片多大
 			lastSize = downloadInfo.Size % MB50
 		} else {
@@ -196,157 +197,14 @@ func DownloadFileOrDir(accessToken string, sources []*FileOrDir, unusedPath stri
 			// 分片下载需要一个信号量让接受文件结果协程知道收集可以结束
 			downloadWG := &sync.WaitGroup{}
 			// 分片下载
-			for i := 0; i < int(sliceNum); i++ {
+			for i := 0; i <= sliceNum; i++ {
+				_i := i
 				downloadWG.Add(1)
 				// 先得到最终的碎片文件路径
 				localDownloadFilePath := fmt.Sprintf(".%s_%d", strings.TrimPrefix(downloadInfo.Path, unusedPath), i)
 				// 如果碎片文件已存在，那么直接算作完成跳过
-				_, err = os.Stat(localDownloadFilePath)
-				if os.IsNotExist(err) {
-					// 不存在，准备启动协程下载
-					// 要启动下载协程时在获取一个下载进程限制器量
-					limitChan <- struct{}{}
-					// 并留点间隔不然百度容易拒绝请求
-					time.Sleep(time.Second + time.Millisecond*time.Duration(rand.Intn(100)))
-					go func(sliceIndex int, innerFileChan chan *fileIndexPath, innerDownloadWG *sync.WaitGroup, _url *url.URL, fileDownloadPath string, bar *mpb.Bar) {
-						header := http.Header{}
-						header.Set("User-Agent", "pan.baidu.com")
-						header.Set("Range", fmt.Sprintf("bytes=%v-%v", sliceIndex*MB50, sliceIndex*MB50+MB50-1))
-						request := http.Request{
-							Method: "GET",
-							URL:    _url,
-							Header: header,
-						}
-						// 重传直到完成
-						for {
-							resp, err := client.Do(&request)
-							if err != nil {
-								fmt.Printf("网络连接错误 clientDo\n")
-								continue
-							}
-							if resp.StatusCode != 206 && resp.StatusCode != 200 {
-								bts, _ := io.ReadAll(resp.Body)
-								fmt.Printf("状态码非 206 %s\n", bts)
-								continue
-							}
-							defer resp.Body.Close()
-							respBytes, err := io.ReadAll(resp.Body)
-							if err != nil {
-								fmt.Printf("返回读取错误 ioReadAll\n")
-								continue
-							}
-							dir, _, err := utils.DivideDirAndFile(fileDownloadPath)
-							if err != nil {
-								continue
-							}
-							if err = os.MkdirAll(dir, 0750); err != nil {
-								fmt.Printf("创建文件夹错误 mkdirAll\n")
-								continue
-							}
-							if err = os.WriteFile(fileDownloadPath, respBytes, 0666); err != nil {
-								fmt.Printf("写文件错误 osWriteFile\n")
-								continue
-							}
-							// 网络请求下载好后要收回下载并发信号量
-							<-limitChan
-							// 保存好文件后，推送自己完成的文件信息
-							innerFileChan <- &fileIndexPath{
-								FilePath: fileDownloadPath,
-								Index:    sliceIndex,
-							}
-							// 进度条增长
-							bar.IncrBy(MB50)
-							// 下载同步量完成一个
-							innerDownloadWG.Done()
-							break
-						}
-					}(i, tempFileChan, downloadWG, realUrl, localDownloadFilePath, tempBar)
-				} else {
-					// 存在，成功跳过
-					// 执行文件成功下载保存后的步骤，推送自己完成的文件信息
-					tempFileChan <- &fileIndexPath{
-						FilePath: localDownloadFilePath,
-						Index:    i,
-					}
-					// 进度条增长
-					tempBar.IncrBy(MB50)
-					downloadWG.Done()
-				}
+				downloadSlideFile(realUrl, _i, localDownloadFilePath, client, limitChan, tempFileChan, tempBar, downloadWG)
 			}
-
-			// 下载最后一个文件
-			downloadWG.Add(1)
-			// 先得到最终的碎片文件路径
-			localDownloadFilePath := fmt.Sprintf(".%s_%d", strings.TrimPrefix(downloadInfo.Path, unusedPath), sliceNum)
-			// 如果碎片文件已存在，那么直接算作完成跳过
-			_, err = os.Stat(localDownloadFilePath)
-			if os.IsNotExist(err) {
-				// 不存在，开启协程下载
-				limitChan <- struct{}{}
-				time.Sleep(time.Second + time.Millisecond*time.Duration(rand.Intn(100)))
-				go func(innerFileChan chan *fileIndexPath, innerDownloadWG *sync.WaitGroup, _url *url.URL, fileDownloadPath string, bar *mpb.Bar) {
-					header := http.Header{}
-					header.Set("User-Agent", "pan.baidu.com")
-					header.Set("Range", fmt.Sprintf("bytes=%v-%v", sliceNum*MB50, sliceNum*MB50+lastSize-1))
-					request := http.Request{
-						Method: "GET",
-						URL:    _url,
-						Header: header,
-					}
-					// 重传直到通过
-					for {
-						resp, err := client.Do(&request)
-						if err != nil {
-							fmt.Printf("网络连接错误 clientDo\n")
-							continue
-						}
-						if resp.StatusCode != 206 && resp.StatusCode != 200 {
-							bts, _ := io.ReadAll(resp.Body)
-							fmt.Printf("状态码非 206 %s\n", bts)
-							continue
-						}
-						defer resp.Body.Close()
-						respBytes, err := io.ReadAll(resp.Body)
-						if err != nil {
-							fmt.Printf("返回读取错误 ioReadAll\n")
-							continue
-						}
-						dir, _, err := utils.DivideDirAndFile(fileDownloadPath)
-						if err != nil {
-							continue
-						}
-						if err = os.MkdirAll(dir, 0750); err != nil {
-							fmt.Printf("创建文件夹错误 mkdirAll\n")
-							continue
-						}
-						if err = os.WriteFile(fileDownloadPath, respBytes, 0666); err != nil {
-							fmt.Printf("写文件错误 osWriteFile\n")
-							continue
-						}
-						<-limitChan
-						// 保存好文件后，推送自己完成的文件信息
-						innerFileChan <- &fileIndexPath{
-							FilePath: fileDownloadPath,
-							Index:    int(sliceNum),
-						}
-						// 进度条增长
-						bar.IncrBy(int(lastSize))
-						innerDownloadWG.Done()
-						break
-					}
-				}(tempFileChan, downloadWG, realUrl, localDownloadFilePath, tempBar)
-			} else {
-				// 存在，成功跳过
-				// 保存好文件后，推送自己完成的文件信息
-				tempFileChan <- &fileIndexPath{
-					FilePath: localDownloadFilePath,
-					Index:    int(sliceNum),
-				}
-				// 进度条增长
-				tempBar.IncrBy(int(lastSize))
-				downloadWG.Done()
-			}
-
 			// 这一步也不阻塞，因为还有下一个文件
 			go func(innerDownloadWG *sync.WaitGroup, innerChan chan *fileIndexPath) {
 				// 都下载并传输结果完毕
@@ -364,50 +222,13 @@ func DownloadFileOrDir(accessToken string, sources []*FileOrDir, unusedPath stri
 				// 不存在，协程下载
 				limitChan <- struct{}{}
 				time.Sleep(time.Second + time.Millisecond*time.Duration(rand.Intn(100)))
-				go func(_url *url.URL, fileDownloadPath string, bar *mpb.Bar, barWG *sync.WaitGroup, fileSize int64) {
-					header := http.Header{}
-					header.Set("User-Agent", "pan.baidu.com")
-					request := http.Request{
-						Method: "GET",
-						URL:    _url,
-						Header: header,
-					}
-					for {
-						resp, err := client.Do(&request)
-						if err != nil {
-							fmt.Printf("网络连接错误 clientDo\n")
-							continue
-						}
-						if resp.StatusCode != 206 && resp.StatusCode != 200 {
-							bts, _ := io.ReadAll(resp.Body)
-							fmt.Printf("状态码非 206 %s\n", bts)
-							continue
-						}
-						defer resp.Body.Close()
-						respBytes, err := io.ReadAll(resp.Body)
-						if err != nil {
-							fmt.Printf("返回读取错误 ioReadAll\n")
-							continue
-						}
-						dir, _, err := utils.DivideDirAndFile(fileDownloadPath)
-						if err != nil {
-							continue
-						}
-						if err = os.MkdirAll(dir, 0750); err != nil {
-							fmt.Printf("创建文件夹错误 mkdirAll\n")
-							continue
-						}
-						if err = os.WriteFile(fileDownloadPath, respBytes, 0666); err != nil {
-							fmt.Printf("写文件错误 osWriteFile\n")
-							continue
-						}
-						<-limitChan
-						// 下载完成，进度条增长
-						bar.IncrBy(int(fileSize))
-						barWG.Done()
-						break
-					}
-				}(realUrl, localDownloadFilePath, tempBar, mpbWG, downloadInfo.Size)
+				go func() {
+					getSlideFile(realUrl, 0, localDownloadFilePath, client)
+					<-limitChan
+					// 下载完成，进度条增长
+					tempBar.IncrBy(int(downloadInfo.Size))
+					mpbWG.Done()
+				}()
 			} else {
 				// 存在，成功跳过
 				tempBar.IncrBy(int(downloadInfo.Size))
@@ -450,4 +271,85 @@ func getDownloadInfo(accessToken string, fsIDList []int64) ([]*DownloadInfo, err
 		return nil, fmt.Errorf("api no return or return err: %v", downloadResp)
 	}
 	return downloadResp.List, nil
+}
+
+// 下载文件切片，每个切片 50 MB
+func getSlideFile(url *url.URL, sliceIndex int, fileDownloadPath string, client http.Client) {
+	header := http.Header{}
+	header.Set("User-Agent", "pan.baidu.com")
+	header.Set("Range", fmt.Sprintf("bytes=%v-%v", sliceIndex*MB50, sliceIndex*MB50+MB50-1))
+	request := http.Request{
+		Method: "GET",
+		URL:    url,
+		Header: header,
+	}
+	// 重传直到完成
+	for {
+		resp, err := client.Do(&request)
+		if err != nil {
+			logrus.Warningf("网络连接错误 clientDo: %v\n", err)
+			time.Sleep(time.Second + time.Millisecond*time.Duration(rand.Intn(100)))
+			continue
+		}
+		if resp.StatusCode != 206 && resp.StatusCode != 200 {
+			bts, _ := io.ReadAll(resp.Body)
+			logrus.Warningf("状态码非 206 :%s\n", bts)
+			time.Sleep(time.Second + time.Millisecond*time.Duration(rand.Intn(100)))
+			continue
+		}
+		defer resp.Body.Close()
+		respBytes, err := io.ReadAll(resp.Body)
+		if err != nil {
+			logrus.Errorf("返回读取错误 ioReadAll: %v\n", err)
+			continue
+		}
+		dir, _, err := utils.DivideDirAndFile(fileDownloadPath)
+		if err != nil {
+			logrus.Errorf("分割文件路径错误: %v\n", err)
+			continue
+		}
+		if err = os.MkdirAll(dir, 0750); err != nil {
+			logrus.Errorf("创建文件夹错误 mkdirAll: %v\n", err)
+			continue
+		}
+		if err = os.WriteFile(fileDownloadPath, respBytes, 0666); err != nil {
+			logrus.Errorf("写文件错误 osWriteFile: %v\n", err)
+			continue
+		}
+	}
+}
+
+func downloadSlideFile(url *url.URL, sliceIndex int, fileDownloadPath string, client http.Client, limitChan chan struct{}, tempFileChan chan *fileIndexPath, tempBar *mpb.Bar, downloadWG *sync.WaitGroup) {
+	_, err := os.Stat(fileDownloadPath)
+	if os.IsNotExist(err) {
+		// 不存在，准备启动协程下载
+		// 要启动下载协程时在获取一个下载进程限制器量
+		limitChan <- struct{}{}
+		// 并留点间隔不然百度容易拒绝请求
+		time.Sleep(time.Second + time.Millisecond*time.Duration(rand.Intn(100)))
+		go func() {
+			getSlideFile(url, sliceIndex, fileDownloadPath, client)
+			// 网络请求下载好后要收回下载并发信号量
+			<-limitChan
+			// 保存好文件后，推送自己完成的文件信息
+			tempFileChan <- &fileIndexPath{
+				FilePath: fileDownloadPath,
+				Index:    sliceIndex,
+			}
+			// 进度条增长
+			tempBar.IncrBy(MB50)
+			// 下载同步量完成一个
+			downloadWG.Done()
+		}()
+	} else {
+		// 存在，成功跳过
+		// 执行文件成功下载保存后的步骤，推送自己完成的文件信息
+		tempFileChan <- &fileIndexPath{
+			FilePath: fileDownloadPath,
+			Index:    sliceIndex,
+		}
+		// 进度条增长
+		tempBar.IncrBy(MB50)
+		downloadWG.Done()
+	}
 }
