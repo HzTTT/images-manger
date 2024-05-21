@@ -83,6 +83,7 @@ func DownloadFileOrDir(accessToken string, sources []*FileOrDir, unusedPath stri
 
 		// 如果文件已存在，并且大小正确，那么就跳过
 		finalDownloadFilePath := fmt.Sprintf(".%s", strings.TrimPrefix(downloadInfo.Path, unusedPath))
+		logrus.Infof(finalDownloadFilePath)
 		finalFileInfo, err := os.Stat(finalDownloadFilePath)
 		if os.IsNotExist(err) {
 			// 不存在，不作为
@@ -99,18 +100,8 @@ func DownloadFileOrDir(accessToken string, sources []*FileOrDir, unusedPath stri
 				}
 			}
 		}
-
-		// 如果文件太大，就下切片
-		var lastSize int64
-		var sliceNum int
-		if downloadInfo.Size > MB50 {
-			// 多少个 50 MB
-			sliceNum = int(downloadInfo.Size / MB50)
-			// 下载完最后的碎片多大
-			lastSize = downloadInfo.Size % MB50
-		} else {
-			lastSize = downloadInfo.Size
-		}
+		// 如果文件切片，每个 50 MB
+		sliceNum := int(downloadInfo.Size / MB50)
 
 		// 每当要下载一个完整的文件，就加一条进度条
 		mpbWG.Add(1)
@@ -135,106 +126,84 @@ func DownloadFileOrDir(accessToken string, sources []*FileOrDir, unusedPath stri
 		if err != nil {
 			return err
 		}
-		if sliceNum > 0 {
-			// 请先看非协程部分代码，只有 limitChan 会起到代码阻塞作用，其他的下载，结果拼接过程都是在协程中进行的。
-			// 目的是为了充分发挥网络并发能力，可以让多个文件同时以切片形式下载
+		// 请先看非协程部分代码，只有 limitChan 会起到代码阻塞作用，其他的下载，结果拼接过程都是在协程中进行的。
+		// 目的是为了充分发挥网络并发能力，可以让多个文件同时以切片形式下载
 
-			// 每一个分片下载的文件都有一个信道作为最后收集碎片文件信息的媒介
-			tempFileChan := make(chan *fileIndexPath, 5)
-			// 有一个独立协程做收集文件信息并最后拼接操作
-			joinSliceWG.Add(1)
-			go func(innerFileChan chan *fileIndexPath, finalFileName string, barWG *sync.WaitGroup) {
-				var sliceFileIndexPaths []*fileIndexPath
-				for tempFileIndexPath := range innerFileChan {
-					sliceFileIndexPaths = append(sliceFileIndexPaths, tempFileIndexPath)
-				}
-				targetFile, err := os.OpenFile("."+strings.TrimPrefix(finalFileName, unusedPath), os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0777)
-				defer targetFile.Close()
+		// 每一个分片下载的文件都有一个信道作为最后收集碎片文件信息的媒介
+		tempFileChan := make(chan *fileIndexPath, 5)
+		// 有一个独立协程做收集文件信息并最后拼接操作
+		joinSliceWG.Add(1)
+		go func(innerFileChan chan *fileIndexPath, finalFileName string, barWG *sync.WaitGroup) {
+			var sliceFileIndexPaths []*fileIndexPath
+			for tempFileIndexPath := range innerFileChan {
+				sliceFileIndexPaths = append(sliceFileIndexPaths, tempFileIndexPath)
+			}
+			targetFile, err := os.OpenFile("."+strings.TrimPrefix(finalFileName, unusedPath), os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0777)
+			defer targetFile.Close()
+			if err != nil {
+				logrus.Errorf("打开目标文件错误: %v\n", err)
+				return
+			}
+			// 按升序排序
+			sort.Slice(sliceFileIndexPaths, func(i, j int) bool {
+				return sliceFileIndexPaths[i].Index < sliceFileIndexPaths[j].Index
+			})
+
+			// 拼接后要删除文件，都删除完拼接过程再算结束
+			removeSliceWG := &sync.WaitGroup{}
+			for i := 0; i < len(sliceFileIndexPaths); i++ {
+				sliceFile, err := os.Open(sliceFileIndexPaths[i].FilePath)
 				if err != nil {
-					fmt.Printf("打开目标文件错误: %v\n", err)
+					logrus.Errorf("打开碎片文件错误: %v\n", err)
 					return
 				}
-				// 按升序排序
-				sort.Slice(sliceFileIndexPaths, func(i, j int) bool {
-					return sliceFileIndexPaths[i].Index < sliceFileIndexPaths[j].Index
-				})
-
-				// 拼接后要删除文件，都删除完拼接过程再算结束
-				removeSliceWG := &sync.WaitGroup{}
-				for i := 0; i < len(sliceFileIndexPaths); i++ {
-					content, err := os.ReadFile(sliceFileIndexPaths[i].FilePath)
-					if err != nil {
-						fmt.Printf("读碎片文件错误")
-						return
-					}
-					_, err = targetFile.Write(content)
-					if err != nil {
-						fmt.Printf("追加文件错误")
-						return
-					}
-					removeSliceWG.Add(1)
-					go func(sliceFile string, wg *sync.WaitGroup) {
-						if err = os.Remove(sliceFile); err != nil {
-							fmt.Printf("删除碎片文件错误")
-							return
-						}
-						wg.Done()
-					}(sliceFileIndexPaths[i].FilePath, removeSliceWG)
+				_, err = io.CopyBuffer(targetFile, sliceFile, make([]byte, MB50))
+				if err != nil {
+					logrus.Errorf("拼接文件错误: %v\n", err)
+					return
 				}
-
-				fmt.Printf("文件拼接好了 %s\n", "."+strings.TrimPrefix(finalFileName, unusedPath))
-				// 进度条展示完成
-				barWG.Done()
-
-				// 等待删除结束
-				removeSliceWG.Wait()
-
-				// 文件拼接完成，意味着单元程序可以结束
-				joinSliceWG.Done()
-
-			}(tempFileChan, downloadInfo.Path, mpbWG)
-
-			// 分片下载需要一个信号量让接受文件结果协程知道收集可以结束
-			downloadWG := &sync.WaitGroup{}
-			// 分片下载
-			for i := 0; i <= sliceNum; i++ {
-				_i := i
-				downloadWG.Add(1)
-				// 先得到最终的碎片文件路径
-				localDownloadFilePath := fmt.Sprintf(".%s_%d", strings.TrimPrefix(downloadInfo.Path, unusedPath), i)
-				// 如果碎片文件已存在，那么直接算作完成跳过
-				downloadSlideFile(realUrl, _i, localDownloadFilePath, client, limitChan, tempFileChan, tempBar, downloadWG)
+				removeSliceWG.Add(1)
+				go func(sliceFile string, wg *sync.WaitGroup) {
+					if err = os.Remove(sliceFile); err != nil {
+						logrus.Errorf("删除碎片文件错误: %v\n", err)
+						return
+					}
+					wg.Done()
+				}(sliceFileIndexPaths[i].FilePath, removeSliceWG)
 			}
-			// 这一步也不阻塞，因为还有下一个文件
-			go func(innerDownloadWG *sync.WaitGroup, innerChan chan *fileIndexPath) {
-				// 都下载并传输结果完毕
-				innerDownloadWG.Wait()
-				// 那么就可以关闭结果传输信道，让结果收集者知道传输完了
-				close(innerChan)
-			}(downloadWG, tempFileChan)
-		} else {
-			// 小文件 不需要分片
-			// 把文件保存为一个文件
-			localDownloadFilePath := "." + strings.TrimPrefix(downloadInfo.Path, unusedPath)
+			logrus.Infof("文件拼接完成: %s\n", finalFileName)
+			// 进度条展示完成
+			barWG.Done()
+
+			// 等待删除结束
+			removeSliceWG.Wait()
+
+			// 文件拼接完成，意味着单元程序可以结束
+			joinSliceWG.Done()
+
+		}(tempFileChan, downloadInfo.Path, mpbWG)
+
+		// 分片下载需要一个信号量让接受文件结果协程知道收集可以结束
+		downloadWG := &sync.WaitGroup{}
+		// 分片下载
+		for i := 0; i <= sliceNum; i++ {
+			logrus.Info("下载文件slice: ", i)
+			_i := i
+			downloadWG.Add(1)
+			// 先得到最终的碎片文件路径
+			localDownloadFilePath := fmt.Sprintf(".%s_%d", strings.TrimPrefix(downloadInfo.Path, unusedPath), i)
 			// 如果碎片文件已存在，那么直接算作完成跳过
-			_, err = os.Stat(localDownloadFilePath)
-			if os.IsNotExist(err) {
-				// 不存在，协程下载
-				limitChan <- struct{}{}
-				time.Sleep(time.Second + time.Millisecond*time.Duration(rand.Intn(100)))
-				go func() {
-					getSlideFile(realUrl, 0, localDownloadFilePath, client)
-					<-limitChan
-					// 下载完成，进度条增长
-					tempBar.IncrBy(int(downloadInfo.Size))
-					mpbWG.Done()
-				}()
-			} else {
-				// 存在，成功跳过
-				tempBar.IncrBy(int(downloadInfo.Size))
-				mpbWG.Done()
-			}
+			limitChan <- struct{}{}
+			downloadSlideFile(realUrl, _i, localDownloadFilePath, client, tempFileChan, tempBar, downloadWG)
+			<-limitChan
 		}
+		// 这一步也不阻塞，因为还有下一个文件
+		go func(innerDownloadWG *sync.WaitGroup, innerChan chan *fileIndexPath) {
+			// 都下载并传输结果完毕
+			innerDownloadWG.Wait()
+			// 那么就可以关闭结果传输信道，让结果收集者知道传输完了
+			close(innerChan)
+		}(downloadWG, tempFileChan)
 	}
 	// 等待进度条都结束
 	progressBars.Wait()
@@ -273,11 +242,15 @@ func getDownloadInfo(accessToken string, fsIDList []int64) ([]*DownloadInfo, err
 	return downloadResp.List, nil
 }
 
-// 下载文件切片，每个切片 50 MB
-func getSlideFile(url *url.URL, sliceIndex int, fileDownloadPath string, client http.Client) {
+// 下载文件切片，每个切片 50 MB，rangeEnd 为 -1 时表示下载到文件末尾
+func getSlideFile(url *url.URL, rangeStart int, rangeEnd int, fileDownloadPath string, client http.Client) {
 	header := http.Header{}
 	header.Set("User-Agent", "pan.baidu.com")
-	header.Set("Range", fmt.Sprintf("bytes=%v-%v", sliceIndex*MB50, sliceIndex*MB50+MB50-1))
+	if rangeEnd == -1 {
+		header.Set("Range", fmt.Sprintf("bytes=%v-", rangeStart))
+	} else {
+		header.Set("Range", fmt.Sprintf("bytes=%v-%v", rangeStart, rangeEnd))
+	}
 	request := http.Request{
 		Method: "GET",
 		URL:    url,
@@ -292,15 +265,15 @@ func getSlideFile(url *url.URL, sliceIndex int, fileDownloadPath string, client 
 			continue
 		}
 		if resp.StatusCode != 206 && resp.StatusCode != 200 {
-			bts, _ := io.ReadAll(resp.Body)
-			logrus.Warningf("状态码非 206 :%s\n", bts)
+			//bts, _ := io.ReadAll(resp.Body)
+			//logrus.Warningf("状态码非 206 :%s\n", bts)
 			time.Sleep(time.Second + time.Millisecond*time.Duration(rand.Intn(100)))
 			continue
 		}
 		defer resp.Body.Close()
 		respBytes, err := io.ReadAll(resp.Body)
 		if err != nil {
-			logrus.Errorf("返回读取错误 ioReadAll: %v\n", err)
+			//logrus.Errorf("返回读取错误 ioReadAll: %v\n", err)
 			continue
 		}
 		dir, _, err := utils.DivideDirAndFile(fileDownloadPath)
@@ -319,18 +292,15 @@ func getSlideFile(url *url.URL, sliceIndex int, fileDownloadPath string, client 
 	}
 }
 
-func downloadSlideFile(url *url.URL, sliceIndex int, fileDownloadPath string, client http.Client, limitChan chan struct{}, tempFileChan chan *fileIndexPath, tempBar *mpb.Bar, downloadWG *sync.WaitGroup) {
+func downloadSlideFile(url *url.URL, sliceIndex int, fileDownloadPath string, client http.Client, tempFileChan chan *fileIndexPath, tempBar *mpb.Bar, downloadWG *sync.WaitGroup) {
 	_, err := os.Stat(fileDownloadPath)
 	if os.IsNotExist(err) {
 		// 不存在，准备启动协程下载
 		// 要启动下载协程时在获取一个下载进程限制器量
-		limitChan <- struct{}{}
 		// 并留点间隔不然百度容易拒绝请求
 		time.Sleep(time.Second + time.Millisecond*time.Duration(rand.Intn(100)))
 		go func() {
-			getSlideFile(url, sliceIndex, fileDownloadPath, client)
-			// 网络请求下载好后要收回下载并发信号量
-			<-limitChan
+			getSlideFile(url, sliceIndex*MB50, sliceIndex*MB50+MB50-1, fileDownloadPath, client)
 			// 保存好文件后，推送自己完成的文件信息
 			tempFileChan <- &fileIndexPath{
 				FilePath: fileDownloadPath,
